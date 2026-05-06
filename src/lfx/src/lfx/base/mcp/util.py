@@ -26,7 +26,6 @@ from pydantic import BaseModel
 
 from lfx.base.agents.utils import maybe_unflatten_dict
 from lfx.log.logger import logger
-from lfx.schema.data import Data
 from lfx.schema.json_schema import create_input_schema_from_json_schema
 from lfx.services.deps import get_settings_service
 from lfx.utils.async_helpers import run_until_complete
@@ -337,13 +336,6 @@ def _is_pydantic_model_type(annotation: Any) -> bool:
     return isinstance(ann, type) and issubclass(ann, BaseModel)
 
 
-def _unwrap_langflow_json_value(value: Any) -> Any:
-    """Return the payload dict from Langflow JSON/Data values wired into MCP object parameters."""
-    if isinstance(value, Data):
-        return value.data
-    return value
-
-
 def _try_convert_value(value: Any, expected_type: type, field_name: str, tool_name: str) -> Any:
     """Try to convert value to expected type. Raise ValueError with clear message on failure."""
 
@@ -355,9 +347,6 @@ def _try_convert_value(value: Any, expected_type: type, field_name: str, tool_na
 
     if value is None and expected_type in (int, float, bool, dict, list):
         raise _err(expected_type_desc, "but received None.")
-
-    if expected_type in (dict, list):
-        value = _unwrap_langflow_json_value(value)
 
     # return correctly typed value, but handle the
     # special case of bool as this is a subclass of int
@@ -438,25 +427,24 @@ def _normalize_arguments_for_mcp(
         expected = _resolve_expected_type(model_field.annotation)
         if expected is None:
             # Nested Pydantic model (object with properties): UI/API often sends as JSON string
-            if _is_pydantic_model_type(model_field.annotation):
-                value = _unwrap_langflow_json_value(value)
-                if isinstance(value, str):
-                    try:
-                        parsed = json.loads(value)
-                    except json.JSONDecodeError as e:
-                        msg = (
-                            f"Tool '{tool_name}': Parameter '{field_name}' expects object "
-                            f"but received invalid JSON string {value!r}; {e}"
-                        )
-                        raise ValueError(msg) from e
-                    if not isinstance(parsed, dict):
-                        msg = (
-                            f"Tool '{tool_name}': Parameter '{field_name}' expects object "
-                            f"but JSON parsed to {type(parsed).__name__}."
-                        )
-                        raise ValueError(msg)  # noqa: TRY004
-                    value = parsed
-            result[field_name] = value
+            if _is_pydantic_model_type(model_field.annotation) and isinstance(value, str):
+                try:
+                    parsed = json.loads(value)
+                except json.JSONDecodeError as e:
+                    msg = (
+                        f"Tool '{tool_name}': Parameter '{field_name}' expects object "
+                        f"but received invalid JSON string {value!r}; {e}"
+                    )
+                    raise ValueError(msg) from e
+                if not isinstance(parsed, dict):
+                    msg = (
+                        f"Tool '{tool_name}': Parameter '{field_name}' expects object "
+                        f"but JSON parsed to {type(parsed).__name__}."
+                    )
+                    raise ValueError(msg)
+                result[field_name] = parsed
+            else:
+                result[field_name] = value
             continue
         if expected is str:
             result[field_name] = value
@@ -1212,9 +1200,10 @@ class MCPSessionManager:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
-        # Wait for session to be ready (use longer timeout for remote connections)
+        # Wait for session to be ready (use mcp_server_timeout setting)
         try:
-            session = await asyncio.wait_for(session_future, timeout=30.0)
+            session_timeout = _get_mcp_setting("mcp_server_timeout", 20)
+            session = await asyncio.wait_for(session_future, timeout=float(session_timeout))
         except asyncio.TimeoutError as timeout_err:
             # Clean up the failed task
             if not task.done():
@@ -1378,7 +1367,8 @@ class MCPSessionManager:
         task.add_done_callback(self._background_tasks.discard)
 
         try:
-            session = await asyncio.wait_for(session_future, timeout=30.0)
+            session_timeout = _get_mcp_setting("mcp_server_timeout", 20)
+            session = await asyncio.wait_for(session_future, timeout=float(session_timeout))
             if used_transport:
                 transport_used = used_transport[0]
                 await logger.ainfo(f"Session {session_id} successfully established using {transport_used}")
@@ -1548,12 +1538,14 @@ class MCPSessionManager:
 
 
 class MCPStdioClient:
-    def __init__(self, component_cache=None):
+    def __init__(self, component_cache=None, tool_execution_timeout: float | None = None):
         self.session: ClientSession | None = None
         self._connection_params = None
         self._connected = False
         self._session_context: str | None = None
         self._component_cache = component_cache
+        # Set timeout: use provided value, or fall back to global setting
+        self._tool_execution_timeout = tool_execution_timeout or _get_mcp_setting("mcp_tool_execution_timeout", 180)
 
     async def _connect_to_server(self, command_str: str, env: dict[str, str] | None = None) -> list[StructuredTool]:
         """Connect to MCP server using stdio transport (SDK style).
@@ -1647,12 +1639,13 @@ class MCPStdioClient:
         session_manager = self._get_session_manager()
         return await session_manager.get_session(self._session_context, self._connection_params, "stdio")
 
-    async def run_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
+    async def run_tool(self, tool_name: str, arguments: dict[str, Any], timeout: float | None = None) -> Any:  # noqa: ASYNC109
         """Run a tool with the given arguments using context-specific session.
 
         Args:
             tool_name: Name of the tool to run
             arguments: Dictionary of arguments to pass to the tool
+            timeout: Optional timeout in seconds. If not provided, uses the client's configured timeout.
 
         Returns:
             The result of the tool execution
@@ -1672,9 +1665,9 @@ class MCPStdioClient:
             param_hash = uuid.uuid4().hex[:8]
             self._session_context = f"default_{param_hash}"
 
-        # Tool-call timeout: env LANGFLOW_MCP_SERVER_TIMEOUT (via settings), with a 180s
-        # floor so default deployments aren't shorter than the previous hardcoded 30s.
-        timeout = max(get_settings_service().settings.mcp_server_timeout, 180.0)
+        # Use provided timeout or fall back to client's configured timeout
+        effective_timeout = timeout if timeout is not None else self._tool_execution_timeout
+
         max_retries = 2
         last_error_type = None
 
@@ -1686,7 +1679,7 @@ class MCPStdioClient:
 
                 result = await asyncio.wait_for(
                     session.call_tool(tool_name, arguments=arguments),
-                    timeout=timeout,
+                    timeout=effective_timeout,
                 )
             except Exception as e:
                 current_error_type = type(e).__name__
@@ -1780,12 +1773,14 @@ class MCPStdioClient:
 
 
 class MCPStreamableHttpClient:
-    def __init__(self, component_cache=None):
+    def __init__(self, component_cache=None, tool_execution_timeout: float | None = None):
         self.session: ClientSession | None = None
         self._connection_params = None
         self._connected = False
         self._session_context: str | None = None
         self._component_cache = component_cache
+        # Set timeout: use provided value, or fall back to global setting
+        self._tool_execution_timeout = tool_execution_timeout or _get_mcp_setting("mcp_tool_execution_timeout", 180)
 
     def _get_session_manager(self) -> MCPSessionManager:
         """Get or create session manager from component cache."""
@@ -1930,12 +1925,13 @@ class MCPStreamableHttpClient:
             # DELETE is advisory—log and continue
             logger.debug(f"Unable to send session DELETE to '{url}': {e}")
 
-    async def run_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
+    async def run_tool(self, tool_name: str, arguments: dict[str, Any], timeout: float | None = None) -> Any:  # noqa: ASYNC109
         """Run a tool with the given arguments using context-specific session.
 
         Args:
             tool_name: Name of the tool to run
             arguments: Dictionary of arguments to pass to the tool
+            timeout: Optional timeout in seconds. If not provided, uses the client's configured timeout.
 
         Returns:
             The result of the tool execution
@@ -1955,9 +1951,9 @@ class MCPStreamableHttpClient:
             param_hash = uuid.uuid4().hex[:8]
             self._session_context = f"default_http_{param_hash}"
 
-        # Tool-call timeout: env LANGFLOW_MCP_SERVER_TIMEOUT (via settings), with a 180s
-        # floor so default deployments aren't shorter than the previous hardcoded 30s.
-        timeout = max(get_settings_service().settings.mcp_server_timeout, 180.0)
+        # Use provided timeout or fall back to client's configured timeout
+        effective_timeout = timeout if timeout is not None else self._tool_execution_timeout
+
         max_retries = 2
         last_error_type = None
 
@@ -1969,7 +1965,7 @@ class MCPStreamableHttpClient:
 
                 result = await asyncio.wait_for(
                     session.call_tool(tool_name, arguments=arguments),
-                    timeout=timeout,
+                    timeout=effective_timeout,
                 )
             except Exception as e:
                 current_error_type = type(e).__name__
@@ -2065,6 +2061,7 @@ async def update_tools(
     mcp_streamable_http_client: MCPStreamableHttpClient | None = None,
     mcp_sse_client: MCPStreamableHttpClient | None = None,  # Backward compatibility
     request_variables: dict[str, str] | None = None,
+    tool_execution_timeout: float | None = None,
 ) -> tuple[str, list[StructuredTool], dict[str, StructuredTool]]:
     """Fetch server config and update available tools.
 
@@ -2075,17 +2072,29 @@ async def update_tools(
         mcp_streamable_http_client: Optional streamable HTTP client instance
         mcp_sse_client: Optional SSE client instance (backward compatibility)
         request_variables: Optional dict of global variables to resolve in headers
+        tool_execution_timeout: Optional timeout in seconds for tool execution (int or float)
     """
     if server_config is None:
         server_config = {}
     if not server_name:
         return "", [], {}
+
     if mcp_stdio_client is None:
-        mcp_stdio_client = MCPStdioClient()
+        mcp_stdio_client = MCPStdioClient(tool_execution_timeout=tool_execution_timeout)
+    else:
+        # Update timeout on existing client (read at execution time)
+        mcp_stdio_client._tool_execution_timeout = tool_execution_timeout
 
     # Backward compatibility: accept mcp_sse_client parameter
     if mcp_streamable_http_client is None:
-        mcp_streamable_http_client = mcp_sse_client if mcp_sse_client is not None else MCPStreamableHttpClient()
+        mcp_streamable_http_client = (
+            mcp_sse_client
+            if mcp_sse_client is not None
+            else MCPStreamableHttpClient(tool_execution_timeout=tool_execution_timeout)
+        )
+    else:
+        # Update timeout on existing client (read at execution time)
+        mcp_streamable_http_client._tool_execution_timeout = tool_execution_timeout
 
     # Fetch server config from backend
     # Determine mode from config, defaulting to Streamable_HTTP if URL present
